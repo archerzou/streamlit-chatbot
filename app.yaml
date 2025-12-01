@@ -10,4 +10,4 @@ env:
   - name: "SERVING_ENDPOINT"
     valueFrom: "serving-endpoint"
   - name: "DATABRICKS_WAREHOUSE_ID"
-    valueFrom: "sql-warehouse-id"
+    value: "65fe0a235cdb4025"
