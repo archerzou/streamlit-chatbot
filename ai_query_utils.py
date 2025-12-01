@@ -4,12 +4,14 @@ Enables querying structured table data using natural language.
 
 Supports two authorization models:
 1. User authorization: Uses the user's access token from x-forwarded-access-token header
-   to query data on behalf of the user (respects Unity Catalog permissions)
-2. App authorization: Uses the app's service principal credentials (fallback for local dev)
+   to query data on behalf of the user (respects Unity Catalog permissions).
+   Uses databricks-sql-connector for direct SQL execution with user token.
+2. App authorization: Uses the app's service principal credentials (fallback for local dev).
+   Uses WorkspaceClient with statement execution API.
 """
 import logging
 import os
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementState
@@ -48,29 +50,82 @@ def get_sql_warehouse_http_path() -> Optional[str]:
     return os.environ.get("SQL_WAREHOUSE_HTTP_PATH")
 
 
-def _get_workspace_client_with_user_token(user_token: str) -> WorkspaceClient:
+def _execute_sql_with_user_token(
+    sql_statement: str, 
+    user_token: str, 
+    http_path: str
+) -> Dict[str, Any]:
     """
-    Create a WorkspaceClient that uses the user's access token.
+    Execute SQL using the databricks-sql-connector with user's access token.
     
-    This enables user authorization where the app acts on behalf of the user,
-    respecting their Unity Catalog permissions.
+    This is the recommended approach for user authorization in Databricks Apps.
+    The SQL connector accepts the token directly without going through unified auth,
+    avoiding conflicts with OAuth credentials in the environment.
     
     Args:
-        user_token: The user's access token from x-forwarded-access-token header.
+        sql_statement: The SQL statement to execute
+        user_token: The user's access token from x-forwarded-access-token header
+        http_path: The SQL warehouse HTTP path
         
     Returns:
-        WorkspaceClient configured with user's token.
+        Dictionary containing the query results or error information.
     """
-    host = os.environ.get("DATABRICKS_HOST")
-    if not host:
-        raise RuntimeError("DATABRICKS_HOST environment variable not set")
-    
-    cfg = Config(
-        host=host,
-        token=user_token,
-        credentials_strategy="pat",
-    )
-    return WorkspaceClient(config=cfg)
+    try:
+        from databricks import sql as databricks_sql
+        
+        cfg = Config()
+        host = cfg.host
+        if not host:
+            host = os.environ.get("DATABRICKS_HOST")
+        if not host:
+            return {
+                "success": False,
+                "error": "DATABRICKS_HOST not configured"
+            }
+        
+        if host.startswith("https://"):
+            host = host[8:]
+        elif host.startswith("http://"):
+            host = host[7:]
+        
+        logger.info("Executing SQL with user authorization via databricks-sql-connector")
+        
+        with databricks_sql.connect(
+            server_hostname=host,
+            http_path=http_path,
+            access_token=user_token,
+        ) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql_statement)
+                
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                rows = cursor.fetchall()
+                
+                results = []
+                for row in rows:
+                    if columns:
+                        results.append(dict(zip(columns, row)))
+                    else:
+                        results.append(list(row))
+                
+                return {
+                    "success": True,
+                    "results": results,
+                    "row_count": len(results)
+                }
+                
+    except ImportError as e:
+        logger.error(f"databricks-sql-connector not installed: {e}")
+        return {
+            "success": False,
+            "error": "databricks-sql-connector package not installed. Please add it to requirements.txt"
+        }
+    except Exception as e:
+        logger.error(f"Error executing SQL with user token: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # Default configuration
@@ -110,36 +165,37 @@ def _get_workspace_client() -> WorkspaceClient:
 
 def _execute_sql(sql: str, warehouse_id: str = None, use_user_auth: bool = True) -> dict:
     """
-    Execute a SQL statement using Databricks SQL Statement Execution API.
+    Execute a SQL statement using Databricks SQL.
     
     Supports two authorization models:
-    1. User authorization (default): Uses the user's access token from HTTP headers
+    1. User authorization (default): Uses databricks-sql-connector with user's access token
        to execute queries on behalf of the user, respecting their Unity Catalog permissions.
-    2. App authorization: Uses the app's service principal credentials (fallback).
+    2. App authorization: Uses WorkspaceClient with service principal credentials (fallback).
     
     Args:
         sql: The SQL statement to execute
-        warehouse_id: Optional warehouse ID. If not provided, uses default.
+        warehouse_id: Optional warehouse ID. If not provided, uses default (only for app auth).
         use_user_auth: If True, attempt to use user authorization first (default: True)
         
     Returns:
         Dictionary containing the query results or error information.
     """
     try:
-        # Try to use user authorization if enabled
-        user_token = None
         if use_user_auth:
             user_token = get_user_access_token()
             if user_token:
-                logger.info("Using user authorization for SQL execution")
-                w = _get_workspace_client_with_user_token(user_token)
+                http_path = get_sql_warehouse_http_path()
+                if http_path:
+                    logger.info("User token and HTTP path available, using user authorization")
+                    return _execute_sql_with_user_token(sql, user_token, http_path)
+                else:
+                    logger.warning("SQL_WAREHOUSE_HTTP_PATH not configured, falling back to app authorization")
             else:
                 logger.info("User token not available, falling back to app authorization")
-                w = _get_workspace_client()
-        else:
-            w = _get_workspace_client()
         
-        # If no warehouse_id provided, try to get one from available warehouses
+        logger.info("Using app authorization (service principal) for SQL execution")
+        w = _get_workspace_client()
+        
         if not warehouse_id:
             warehouses = list(w.warehouses.list())
             if not warehouses:
@@ -147,21 +203,17 @@ def _execute_sql(sql: str, warehouse_id: str = None, use_user_auth: bool = True)
                     "success": False,
                     "error": "No SQL warehouses available. Please configure a SQL warehouse."
                 }
-            # Use the first available running warehouse, or the first one if none running
             running_warehouses = [wh for wh in warehouses if wh.state and wh.state.value == "RUNNING"]
             warehouse = running_warehouses[0] if running_warehouses else warehouses[0]
             warehouse_id = warehouse.id
             
-        # Execute the SQL statement
         response = w.statement_execution.execute_statement(
             warehouse_id=warehouse_id,
             statement=sql,
             wait_timeout="30s"
         )
         
-        # Check execution status
         if response.status and response.status.state == StatementState.SUCCEEDED:
-            # Extract results
             results = []
             if response.result and response.result.data_array:
                 columns = []
