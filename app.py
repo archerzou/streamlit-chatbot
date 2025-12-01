@@ -21,7 +21,7 @@ assert SERVING_ENDPOINT, \
 AI_QUERY_ENDPOINT = "databricks-gpt-oss-120b"
 CATALOG = "dev_structured"
 SCHEMA = "analytics"
-TABLE = "measuresponses_impairment"
+TABLE = "measureresponses_impairment"
 
 # Check if the endpoint is supported
 endpoint_supported = is_endpoint_supported(SERVING_ENDPOINT)
@@ -34,7 +34,12 @@ def get_user_info():
         user_id=headers.get("X-Forwarded-User"),
     )
 
+def get_user_token():
+    """Extract user access token from Databricks App request headers."""
+    return st.context.headers.get('X-Forwarded-Access-Token')
+
 user_info = get_user_info()
+user_token = get_user_token()
 
 # Streamlit app
 if "visibility" not in st.session_state:
@@ -111,6 +116,7 @@ else:
                 with st.spinner("Querying impairment data..."):
                     result = query_impairment_data(
                         user_question=prompt,
+                        user_token=user_token,
                         mode="general",
                         endpoint=AI_QUERY_ENDPOINT,
                         catalog=CATALOG,

@@ -3,20 +3,21 @@ Utility functions for Databricks ai_query integration.
 Enables querying structured table data using natural language.
 """
 import logging
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementState
+import os
+from databricks import sql
+from databricks.sdk.core import Config
 
 logger = logging.getLogger(__name__)
 
 # Default configuration
 DEFAULT_CATALOG = "dev_structured"
 DEFAULT_SCHEMA = "analytics"
-DEFAULT_TABLE = "measuresponses_impairment"
+DEFAULT_TABLE = "measureresponses_impairment"
 DEFAULT_ENDPOINT = "databricks-gpt-oss-120b"
 
 # Table schema information for context
 TABLE_SCHEMA_INFO = """
-Table: dev_structured.analytics.measuresponses_impairment
+Table: dev_structured.analytics.measureresponses_impairment
 Description: Healthcare text data containing responses about disabilities and impairments.
 
 Key columns:
@@ -38,81 +39,106 @@ def get_table_info() -> str:
     return TABLE_SCHEMA_INFO
 
 
-def _get_workspace_client() -> WorkspaceClient:
-    """Get a Databricks WorkspaceClient instance."""
-    return WorkspaceClient()
+def _get_databricks_config() -> Config:
+    """Get Databricks configuration."""
+    return Config()
 
 
-def _execute_sql(sql: str, warehouse_id: str = None) -> dict:
+def _execute_sql_with_user_token(query: str, user_token: str) -> dict:
     """
-    Execute a SQL statement using Databricks SQL Statement Execution API.
+    Execute a SQL query using the user's access token for authentication.
+    This method ensures the query runs with the user's permissions.
     
     Args:
-        sql: The SQL statement to execute
-        warehouse_id: Optional warehouse ID. If not provided, uses default.
+        query: The SQL statement to execute
+        user_token: The user's access token from X-Forwarded-Access-Token header
         
     Returns:
         Dictionary containing the query results or error information.
     """
     try:
-        w = _get_workspace_client()
+        cfg = _get_databricks_config()
+        warehouse_id = os.getenv('DATABRICKS_WAREHOUSE_ID')
         
-        # If no warehouse_id provided, try to get one from available warehouses
         if not warehouse_id:
-            warehouses = list(w.warehouses.list())
-            if not warehouses:
-                return {
-                    "success": False,
-                    "error": "No SQL warehouses available. Please configure a SQL warehouse."
-                }
-            # Use the first available running warehouse, or the first one if none running
-            running_warehouses = [wh for wh in warehouses if wh.state and wh.state.value == "RUNNING"]
-            warehouse = running_warehouses[0] if running_warehouses else warehouses[0]
-            warehouse_id = warehouse.id
-            
-        # Execute the SQL statement
-        response = w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id,
-            statement=sql,
-            wait_timeout="30s"
-        )
+            return {
+                "success": False,
+                "error": "DATABRICKS_WAREHOUSE_ID environment variable is not set. Please configure it in app.yaml."
+            }
         
-        # Check execution status
-        if response.status and response.status.state == StatementState.SUCCEEDED:
-            # Extract results
-            results = []
-            if response.result and response.result.data_array:
-                columns = []
-                if response.manifest and response.manifest.schema and response.manifest.schema.columns:
-                    columns = [col.name for col in response.manifest.schema.columns]
+        if not user_token:
+            return {
+                "success": False,
+                "error": "User access token not available. Please ensure you are running in a Databricks App environment."
+            }
+        
+        with sql.connect(
+            server_hostname=cfg.host,
+            http_path=f"/sql/1.0/warehouses/{warehouse_id}",
+            access_token=user_token
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                df = cursor.fetchall_arrow().to_pandas()
                 
-                for row in response.result.data_array:
-                    if columns:
-                        results.append(dict(zip(columns, row)))
-                    else:
-                        results.append(row)
-            
-            return {
-                "success": True,
-                "results": results,
-                "row_count": len(results)
-            }
-        elif response.status and response.status.state == StatementState.FAILED:
-            error_msg = "Query execution failed"
-            if response.status.error:
-                error_msg = response.status.error.message or error_msg
-            return {
-                "success": False,
-                "error": error_msg
-            }
-        else:
-            return {
-                "success": False,
-                "error": f"Query in unexpected state: {response.status.state if response.status else 'unknown'}"
-            }
-            
+                # Convert DataFrame to list of dictionaries
+                results = df.to_dict('records')
+                
+                return {
+                    "success": True,
+                    "results": results,
+                    "row_count": len(results)
+                }
+                
     except Exception as e:
         logger.error(f"Error executing SQL: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def _execute_sql_with_service_principal(query: str) -> dict:
+    """
+    Execute a SQL query using Service Principal credentials.
+    Fallback method when user token is not available.
+    
+    Args:
+        query: The SQL statement to execute
+        
+    Returns:
+        Dictionary containing the query results or error information.
+    """
+    try:
+        cfg = _get_databricks_config()
+        warehouse_id = os.getenv('DATABRICKS_WAREHOUSE_ID')
+        
+        if not warehouse_id:
+            return {
+                "success": False,
+                "error": "DATABRICKS_WAREHOUSE_ID environment variable is not set. Please configure it in app.yaml."
+            }
+        
+        with sql.connect(
+            server_hostname=cfg.host,
+            http_path=f"/sql/1.0/warehouses/{warehouse_id}",
+            credentials_provider=lambda: cfg.authenticate
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                df = cursor.fetchall_arrow().to_pandas()
+                
+                # Convert DataFrame to list of dictionaries
+                results = df.to_dict('records')
+                
+                return {
+                    "success": True,
+                    "results": results,
+                    "row_count": len(results)
+                }
+                
+    except Exception as e:
+        logger.error(f"Error executing SQL with service principal: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -222,31 +248,31 @@ def build_data_analysis_sql(
 
 def query_impairment_data(
     user_question: str,
+    user_token: str,
     mode: str = "general",
     endpoint: str = DEFAULT_ENDPOINT,
     catalog: str = DEFAULT_CATALOG,
     schema: str = DEFAULT_SCHEMA,
-    table: str = DEFAULT_TABLE,
-    warehouse_id: str = None
+    table: str = DEFAULT_TABLE
 ) -> dict:
     """
     Query the impairment data table using ai_query based on user's natural language question.
     
     Args:
         user_question: The user's natural language question
+        user_token: The user's access token from X-Forwarded-Access-Token header
         mode: Query mode - "general" for general questions, "analyze" for data analysis
         endpoint: The model serving endpoint name
         catalog: The catalog name
         schema: The schema name
         table: The table name
-        warehouse_id: Optional SQL warehouse ID
         
     Returns:
         Dictionary containing the response or error information
     """
     try:
         if mode == "analyze":
-            sql = build_data_analysis_sql(
+            query = build_data_analysis_sql(
                 user_question=user_question,
                 endpoint=endpoint,
                 catalog=catalog,
@@ -254,7 +280,7 @@ def query_impairment_data(
                 table=table
             )
         else:
-            sql = build_ai_query_sql(
+            query = build_ai_query_sql(
                 user_question=user_question,
                 endpoint=endpoint,
                 catalog=catalog,
@@ -262,9 +288,9 @@ def query_impairment_data(
                 table=table
             )
         
-        logger.info(f"Executing ai_query SQL: {sql[:200]}...")
+        logger.info(f"Executing ai_query SQL: {query[:200]}...")
         
-        result = _execute_sql(sql, warehouse_id)
+        result = _execute_sql_with_user_token(query, user_token)
         
         if result["success"]:
             # Extract the response from results
