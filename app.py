@@ -34,6 +34,22 @@ def get_user_info():
         user_id=headers.get("X-Forwarded-User"),
     )
 
+
+def get_user_access_token():
+    """
+    Get the user's access token from Databricks App headers.
+    This token is used for user authorization to query resources on behalf of the user.
+    
+    Returns:
+        The user's access token if available, None otherwise.
+    """
+    try:
+        headers = st.context.headers
+        return headers.get("X-Forwarded-Access-Token")
+    except Exception:
+        return None
+
+
 user_info = get_user_info()
 
 # Streamlit app
@@ -107,6 +123,9 @@ else:
         # Display assistant response in chat message container
         with st.chat_message("assistant"):
             if query_mode == "Data Query (ai_query)":
+                # Get user access token for user authorization
+                user_token = get_user_access_token()
+                
                 # Use ai_query to process the question
                 with st.spinner("Querying impairment data..."):
                     result = query_impairment_data(
@@ -115,7 +134,8 @@ else:
                         endpoint=AI_QUERY_ENDPOINT,
                         catalog=CATALOG,
                         schema=SCHEMA,
-                        table=TABLE
+                        table=TABLE,
+                        user_token=user_token
                     )
                 
                 if result["success"]:

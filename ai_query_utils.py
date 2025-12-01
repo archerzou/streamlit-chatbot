@@ -3,8 +3,11 @@ Utility functions for Databricks ai_query integration.
 Enables querying structured table data using natural language.
 """
 import logging
+import os
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementState
+from databricks import sql
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +46,110 @@ def _get_workspace_client() -> WorkspaceClient:
     return WorkspaceClient()
 
 
-def _execute_sql(sql: str, warehouse_id: str = None) -> dict:
+def _get_warehouse_http_path(warehouse_id: str = None) -> str:
     """
-    Execute a SQL statement using Databricks SQL Statement Execution API.
+    Get the HTTP path for a SQL warehouse.
     
     Args:
-        sql: The SQL statement to execute
+        warehouse_id: Optional warehouse ID. If not provided, uses first available.
+        
+    Returns:
+        HTTP path string for the warehouse.
+    """
+    w = _get_workspace_client()
+    
+    if not warehouse_id:
+        warehouses = list(w.warehouses.list())
+        if not warehouses:
+            raise ValueError("No SQL warehouses available. Please configure a SQL warehouse.")
+        running_warehouses = [wh for wh in warehouses if wh.state and wh.state.value == "RUNNING"]
+        warehouse = running_warehouses[0] if running_warehouses else warehouses[0]
+        warehouse_id = warehouse.id
+    
+    return f"/sql/1.0/warehouses/{warehouse_id}"
+
+
+def _execute_sql_with_user_token(sql_statement: str, user_token: str, warehouse_id: str = None) -> dict:
+    """
+    Execute a SQL statement using the user's access token for authorization.
+    This enables querying on behalf of the user with their permissions.
+    
+    Args:
+        sql_statement: The SQL statement to execute
+        user_token: The user's access token from X-Forwarded-Access-Token header
         warehouse_id: Optional warehouse ID. If not provided, uses default.
         
     Returns:
         Dictionary containing the query results or error information.
     """
+    try:
+        cfg = Config()
+        http_path = _get_warehouse_http_path(warehouse_id)
+        
+        logger.info(f"Executing SQL with user token, warehouse path: {http_path}")
+        
+        conn = sql.connect(
+            server_hostname=cfg.host,
+            http_path=http_path,
+            access_token=user_token
+        )
+        
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql_statement)
+                
+                # Get column names
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                
+                # Fetch results
+                rows = cursor.fetchall()
+                
+                results = []
+                for row in rows:
+                    if columns:
+                        results.append(dict(zip(columns, row)))
+                    else:
+                        results.append(list(row))
+                
+                return {
+                    "success": True,
+                    "results": results,
+                    "row_count": len(results)
+                }
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        logger.error(f"Error executing SQL with user token: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def _execute_sql(sql_statement: str, warehouse_id: str = None, user_token: str = None) -> dict:
+    """
+    Execute a SQL statement using Databricks SQL.
+    
+    If a user_token is provided, uses the databricks-sql-connector with user authorization
+    to query on behalf of the user. Otherwise, falls back to the service principal
+    using the Statement Execution API.
+    
+    Args:
+        sql_statement: The SQL statement to execute
+        warehouse_id: Optional warehouse ID. If not provided, uses default.
+        user_token: Optional user access token for user authorization.
+        
+    Returns:
+        Dictionary containing the query results or error information.
+    """
+    # If user token is provided, use user authorization
+    if user_token:
+        logger.info("Using user authorization for SQL execution")
+        return _execute_sql_with_user_token(sql_statement, user_token, warehouse_id)
+    
+    # Fall back to service principal authorization
+    logger.info("Using service principal authorization for SQL execution")
     try:
         w = _get_workspace_client()
         
@@ -73,7 +169,7 @@ def _execute_sql(sql: str, warehouse_id: str = None) -> dict:
         # Execute the SQL statement
         response = w.statement_execution.execute_statement(
             warehouse_id=warehouse_id,
-            statement=sql,
+            statement=sql_statement,
             wait_timeout="30s"
         )
         
@@ -227,7 +323,8 @@ def query_impairment_data(
     catalog: str = DEFAULT_CATALOG,
     schema: str = DEFAULT_SCHEMA,
     table: str = DEFAULT_TABLE,
-    warehouse_id: str = None
+    warehouse_id: str = None,
+    user_token: str = None
 ) -> dict:
     """
     Query the impairment data table using ai_query based on user's natural language question.
@@ -240,13 +337,14 @@ def query_impairment_data(
         schema: The schema name
         table: The table name
         warehouse_id: Optional SQL warehouse ID
+        user_token: Optional user access token for user authorization (from X-Forwarded-Access-Token header)
         
     Returns:
         Dictionary containing the response or error information
     """
     try:
         if mode == "analyze":
-            sql = build_data_analysis_sql(
+            sql_query = build_data_analysis_sql(
                 user_question=user_question,
                 endpoint=endpoint,
                 catalog=catalog,
@@ -254,7 +352,7 @@ def query_impairment_data(
                 table=table
             )
         else:
-            sql = build_ai_query_sql(
+            sql_query = build_ai_query_sql(
                 user_question=user_question,
                 endpoint=endpoint,
                 catalog=catalog,
@@ -262,9 +360,9 @@ def query_impairment_data(
                 table=table
             )
         
-        logger.info(f"Executing ai_query SQL: {sql[:200]}...")
+        logger.info(f"Executing ai_query SQL: {sql_query[:200]}...")
         
-        result = _execute_sql(sql, warehouse_id)
+        result = _execute_sql(sql_query, warehouse_id, user_token)
         
         if result["success"]:
             # Extract the response from results
