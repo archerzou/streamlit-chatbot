@@ -2,133 +2,18 @@
 Utility functions for Databricks ai_query integration.
 Enables querying structured table data using natural language.
 
-Supports two authorization models:
-1. User authorization: Uses the user's access token from x-forwarded-access-token header
-   to query data on behalf of the user (respects Unity Catalog permissions).
-   Uses databricks-sql-connector for direct SQL execution with user token.
-2. App authorization: Uses the app's service principal credentials (fallback for local dev).
-   Uses WorkspaceClient with statement execution API.
+Uses app authorization via credentials_provider for SQL connections.
 """
 import logging
 import os
-from typing import Optional, List, Dict, Any
-from databricks.sdk import WorkspaceClient
+from typing import Optional, Dict, Any
 from databricks.sdk.core import Config
-from databricks.sdk.service.sql import StatementState
+from databricks import sql as databricks_sql
 
 logger = logging.getLogger(__name__)
 
+cfg = Config()
 
-def get_user_access_token() -> Optional[str]:
-    """
-    Get the user's access token from Databricks Apps HTTP headers.
-    
-    When running as a Databricks App with user authorization enabled,
-    the user's access token is forwarded via the x-forwarded-access-token header.
-    
-    Returns:
-        The user's access token if available, None otherwise.
-    """
-    try:
-        import streamlit as st
-        return st.context.headers.get("x-forwarded-access-token")
-    except Exception as e:
-        logger.debug(f"Could not get user access token from headers: {e}")
-        return None
-
-
-def get_sql_warehouse_http_path() -> Optional[str]:
-    """
-    Get the SQL warehouse HTTP path from environment variable.
-    
-    The SQL_WAREHOUSE_HTTP_PATH environment variable is set via app.yaml
-    using the valueFrom directive to map the sql-warehouse resource.
-    
-    Returns:
-        The SQL warehouse HTTP path if configured, None otherwise.
-    """
-    return os.environ.get("SQL_WAREHOUSE_HTTP_PATH")
-
-
-def _execute_sql_with_user_token(
-    sql_statement: str, 
-    user_token: str, 
-    http_path: str
-) -> Dict[str, Any]:
-    """
-    Execute SQL using the databricks-sql-connector with user's access token.
-    
-    This is the recommended approach for user authorization in Databricks Apps.
-    The SQL connector accepts the token directly without going through unified auth,
-    avoiding conflicts with OAuth credentials in the environment.
-    
-    Args:
-        sql_statement: The SQL statement to execute
-        user_token: The user's access token from x-forwarded-access-token header
-        http_path: The SQL warehouse HTTP path
-        
-    Returns:
-        Dictionary containing the query results or error information.
-    """
-    try:
-        from databricks import sql as databricks_sql
-        
-        cfg = Config()
-        host = cfg.host
-        if not host:
-            host = os.environ.get("DATABRICKS_HOST")
-        if not host:
-            return {
-                "success": False,
-                "error": "DATABRICKS_HOST not configured"
-            }
-        
-        if host.startswith("https://"):
-            host = host[8:]
-        elif host.startswith("http://"):
-            host = host[7:]
-        
-        logger.info("Executing SQL with user authorization via databricks-sql-connector")
-        
-        with databricks_sql.connect(
-            server_hostname=host,
-            http_path=http_path,
-            access_token=user_token,
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql_statement)
-                
-                columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                rows = cursor.fetchall()
-                
-                results = []
-                for row in rows:
-                    if columns:
-                        results.append(dict(zip(columns, row)))
-                    else:
-                        results.append(list(row))
-                
-                return {
-                    "success": True,
-                    "results": results,
-                    "row_count": len(results)
-                }
-                
-    except ImportError as e:
-        logger.error(f"databricks-sql-connector not installed: {e}")
-        return {
-            "success": False,
-            "error": "databricks-sql-connector package not installed. Please add it to requirements.txt"
-        }
-    except Exception as e:
-        logger.error(f"Error executing SQL with user token: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-# Default configuration
 DEFAULT_CATALOG = "dev_structured"
 DEFAULT_SCHEMA = "analytics"
 DEFAULT_TABLE = "measuresponses_impairment"
@@ -158,93 +43,72 @@ def get_table_info() -> str:
     return TABLE_SCHEMA_INFO
 
 
-def _get_workspace_client() -> WorkspaceClient:
-    """Get a Databricks WorkspaceClient instance."""
-    return WorkspaceClient()
-
-
-def _execute_sql(sql: str, warehouse_id: str = None, use_user_auth: bool = True) -> dict:
+def get_sql_warehouse_http_path() -> Optional[str]:
     """
-    Execute a SQL statement using Databricks SQL.
+    Get the SQL warehouse HTTP path from environment variable.
     
-    Supports two authorization models:
-    1. User authorization (default): Uses databricks-sql-connector with user's access token
-       to execute queries on behalf of the user, respecting their Unity Catalog permissions.
-    2. App authorization: Uses WorkspaceClient with service principal credentials (fallback).
+    The SQL_WAREHOUSE_HTTP_PATH environment variable is set via app.yaml
+    using the valueFrom directive to map the sql-warehouse resource.
+    """
+    return os.environ.get("SQL_WAREHOUSE_HTTP_PATH")
+
+
+def get_connection(http_path: Optional[str] = None):
+    """
+    Get a SQL connection using app authorization.
+    
+    Uses credentials_provider=lambda: cfg.authenticate which leverages
+    the app's service principal credentials (DATABRICKS_CLIENT_ID and
+    DATABRICKS_CLIENT_SECRET) automatically injected by Databricks Apps.
+    """
+    if not http_path:
+        http_path = get_sql_warehouse_http_path()
+    if not http_path:
+        raise RuntimeError("SQL warehouse HTTP path not configured. Set SQL_WAREHOUSE_HTTP_PATH environment variable.")
+    
+    return databricks_sql.connect(
+        server_hostname=cfg.host,
+        http_path=http_path,
+        credentials_provider=lambda: cfg.authenticate,
+    )
+
+
+def _execute_sql(sql_statement: str, http_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Execute a SQL statement using Databricks SQL connector.
+    
+    Uses app authorization via credentials_provider.
     
     Args:
-        sql: The SQL statement to execute
-        warehouse_id: Optional warehouse ID. If not provided, uses default (only for app auth).
-        use_user_auth: If True, attempt to use user authorization first (default: True)
+        sql_statement: The SQL statement to execute
+        http_path: Optional SQL warehouse HTTP path
         
     Returns:
         Dictionary containing the query results or error information.
     """
     try:
-        if use_user_auth:
-            user_token = get_user_access_token()
-            if user_token:
-                http_path = get_sql_warehouse_http_path()
-                if http_path:
-                    logger.info("User token and HTTP path available, using user authorization")
-                    return _execute_sql_with_user_token(sql, user_token, http_path)
-                else:
-                    logger.warning("SQL_WAREHOUSE_HTTP_PATH not configured, falling back to app authorization")
-            else:
-                logger.info("User token not available, falling back to app authorization")
+        logger.info("Executing SQL via databricks-sql-connector with app authorization")
         
-        logger.info("Using app authorization (service principal) for SQL execution")
-        w = _get_workspace_client()
-        
-        if not warehouse_id:
-            warehouses = list(w.warehouses.list())
-            if not warehouses:
-                return {
-                    "success": False,
-                    "error": "No SQL warehouses available. Please configure a SQL warehouse."
-                }
-            running_warehouses = [wh for wh in warehouses if wh.state and wh.state.value == "RUNNING"]
-            warehouse = running_warehouses[0] if running_warehouses else warehouses[0]
-            warehouse_id = warehouse.id
-            
-        response = w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id,
-            statement=sql,
-            wait_timeout="30s"
-        )
-        
-        if response.status and response.status.state == StatementState.SUCCEEDED:
-            results = []
-            if response.result and response.result.data_array:
-                columns = []
-                if response.manifest and response.manifest.schema and response.manifest.schema.columns:
-                    columns = [col.name for col in response.manifest.schema.columns]
+        with get_connection(http_path) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql_statement)
                 
-                for row in response.result.data_array:
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                rows = cursor.fetchall()
+                
+                results = []
+                for row in rows:
                     if columns:
                         results.append(dict(zip(columns, row)))
                     else:
-                        results.append(row)
-            
-            return {
-                "success": True,
-                "results": results,
-                "row_count": len(results)
-            }
-        elif response.status and response.status.state == StatementState.FAILED:
-            error_msg = "Query execution failed"
-            if response.status.error:
-                error_msg = response.status.error.message or error_msg
-            return {
-                "success": False,
-                "error": error_msg
-            }
-        else:
-            return {
-                "success": False,
-                "error": f"Query in unexpected state: {response.status.state if response.status else 'unknown'}"
-            }
-            
+                        results.append(list(row))
+                
+                return {
+                    "success": True,
+                    "results": results,
+                    "row_count": len(results)
+                }
+                
     except Exception as e:
         logger.error(f"Error executing SQL: {e}")
         return {
@@ -361,7 +225,7 @@ def query_impairment_data(
     catalog: str = DEFAULT_CATALOG,
     schema: str = DEFAULT_SCHEMA,
     table: str = DEFAULT_TABLE,
-    warehouse_id: str = None
+    http_path: Optional[str] = None
 ) -> dict:
     """
     Query the impairment data table using ai_query based on user's natural language question.
@@ -373,7 +237,7 @@ def query_impairment_data(
         catalog: The catalog name
         schema: The schema name
         table: The table name
-        warehouse_id: Optional SQL warehouse ID
+        http_path: Optional SQL warehouse HTTP path
         
     Returns:
         Dictionary containing the response or error information
@@ -398,7 +262,7 @@ def query_impairment_data(
         
         logger.info(f"Executing ai_query SQL: {sql[:200]}...")
         
-        result = _execute_sql(sql, warehouse_id)
+        result = _execute_sql(sql, http_path)
         
         if result["success"]:
             # Extract the response from results
