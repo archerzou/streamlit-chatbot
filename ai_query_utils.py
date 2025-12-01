@@ -1,12 +1,72 @@
 """
 Utility functions for Databricks ai_query integration.
 Enables querying structured table data using natural language.
+
+Supports two authorization models:
+1. User authorization: Uses the user's access token from x-forwarded-access-token header
+   to query data on behalf of the user (respects Unity Catalog permissions)
+2. App authorization: Uses the app's service principal credentials (fallback for local dev)
 """
 import logging
+import os
+from typing import Optional
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementState
 
 logger = logging.getLogger(__name__)
+
+
+def get_user_access_token() -> Optional[str]:
+    """
+    Get the user's access token from Databricks Apps HTTP headers.
+    
+    When running as a Databricks App with user authorization enabled,
+    the user's access token is forwarded via the x-forwarded-access-token header.
+    
+    Returns:
+        The user's access token if available, None otherwise.
+    """
+    try:
+        import streamlit as st
+        return st.context.headers.get("x-forwarded-access-token")
+    except Exception as e:
+        logger.debug(f"Could not get user access token from headers: {e}")
+        return None
+
+
+def get_sql_warehouse_http_path() -> Optional[str]:
+    """
+    Get the SQL warehouse HTTP path from environment variable.
+    
+    The SQL_WAREHOUSE_HTTP_PATH environment variable is set via app.yaml
+    using the valueFrom directive to map the sql-warehouse resource.
+    
+    Returns:
+        The SQL warehouse HTTP path if configured, None otherwise.
+    """
+    return os.environ.get("SQL_WAREHOUSE_HTTP_PATH")
+
+
+def _get_workspace_client_with_user_token(user_token: str) -> WorkspaceClient:
+    """
+    Create a WorkspaceClient that uses the user's access token.
+    
+    This enables user authorization where the app acts on behalf of the user,
+    respecting their Unity Catalog permissions.
+    
+    Args:
+        user_token: The user's access token from x-forwarded-access-token header.
+        
+    Returns:
+        WorkspaceClient configured with user's token.
+    """
+    cfg = Config()
+    return WorkspaceClient(
+        host=cfg.host,
+        token=user_token
+    )
+
 
 # Default configuration
 DEFAULT_CATALOG = "dev_structured"
@@ -43,19 +103,36 @@ def _get_workspace_client() -> WorkspaceClient:
     return WorkspaceClient()
 
 
-def _execute_sql(sql: str, warehouse_id: str = None) -> dict:
+def _execute_sql(sql: str, warehouse_id: str = None, use_user_auth: bool = True) -> dict:
     """
     Execute a SQL statement using Databricks SQL Statement Execution API.
+    
+    Supports two authorization models:
+    1. User authorization (default): Uses the user's access token from HTTP headers
+       to execute queries on behalf of the user, respecting their Unity Catalog permissions.
+    2. App authorization: Uses the app's service principal credentials (fallback).
     
     Args:
         sql: The SQL statement to execute
         warehouse_id: Optional warehouse ID. If not provided, uses default.
+        use_user_auth: If True, attempt to use user authorization first (default: True)
         
     Returns:
         Dictionary containing the query results or error information.
     """
     try:
-        w = _get_workspace_client()
+        # Try to use user authorization if enabled
+        user_token = None
+        if use_user_auth:
+            user_token = get_user_access_token()
+            if user_token:
+                logger.info("Using user authorization for SQL execution")
+                w = _get_workspace_client_with_user_token(user_token)
+            else:
+                logger.info("User token not available, falling back to app authorization")
+                w = _get_workspace_client()
+        else:
+            w = _get_workspace_client()
         
         # If no warehouse_id provided, try to get one from available warehouses
         if not warehouse_id:
