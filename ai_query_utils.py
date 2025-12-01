@@ -61,11 +61,16 @@ def _get_workspace_client_with_user_token(user_token: str) -> WorkspaceClient:
     Returns:
         WorkspaceClient configured with user's token.
     """
-    cfg = Config()
-    return WorkspaceClient(
-        host=cfg.host,
-        token=user_token
+    host = os.environ.get("DATABRICKS_HOST")
+    if not host:
+        raise RuntimeError("DATABRICKS_HOST environment variable not set")
+    
+    cfg = Config(
+        host=host,
+        token=user_token,
+        credentials_strategy="pat",
     )
+    return WorkspaceClient(config=cfg)
 
 
 # Default configuration
