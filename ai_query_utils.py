@@ -248,24 +248,24 @@ def build_data_analysis_sql(
 
 def query_impairment_data(
     user_question: str,
-    user_token: str,
     mode: str = "general",
     endpoint: str = DEFAULT_ENDPOINT,
     catalog: str = DEFAULT_CATALOG,
     schema: str = DEFAULT_SCHEMA,
-    table: str = DEFAULT_TABLE
+    table: str = DEFAULT_TABLE,
+    user_token: str = None
 ) -> dict:
     """
     Query the impairment data table using ai_query based on user's natural language question.
     
     Args:
         user_question: The user's natural language question
-        user_token: The user's access token from X-Forwarded-Access-Token header
         mode: Query mode - "general" for general questions, "analyze" for data analysis
         endpoint: The model serving endpoint name
         catalog: The catalog name
         schema: The schema name
         table: The table name
+        user_token: The user's access token from X-Forwarded-Access-Token header (optional)
         
     Returns:
         Dictionary containing the response or error information
@@ -290,7 +290,11 @@ def query_impairment_data(
         
         logger.info(f"Executing ai_query SQL: {query[:200]}...")
         
-        result = _execute_sql_with_user_token(query, user_token)
+        # Use user token authentication if available, otherwise fall back to service principal
+        if user_token:
+            result = _execute_sql_with_user_token(query, user_token)
+        else:
+            result = _execute_sql_with_service_principal(query)
         
         if result["success"]:
             # Extract the response from results
