@@ -9,3 +9,5 @@ env:
     value: "false"
   - name: "SERVING_ENDPOINT"
     valueFrom: "serving-endpoint"
+  - name: "DATABRICKS_WAREHOUSE_ID"
+    value: "65fe0a235cdb4025"
